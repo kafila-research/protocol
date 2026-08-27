@@ -1,6 +1,7 @@
 package reach
 
 import (
+	"net"
 	"testing"
 	"time"
 )
@@ -17,7 +18,13 @@ func TestLoopbackLooksPermissive(t *testing.T) {
 	defer s.Close()
 
 	primary, alt := s.Addrs()
-	b, err := Probe(primary, alt, 2*time.Second)
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+	defer pc.Close()
+
+	b, err := Probe(pc, primary, alt, 2*time.Second)
 	if err != nil {
 		t.Fatalf("probe: %v", err)
 	}
@@ -46,7 +53,13 @@ func TestLoopbackLooksPermissive(t *testing.T) {
 // be reported as a NAT behaviour.
 func TestNoServerReportsBlockedRatherThanRestrictive(t *testing.T) {
 	// Nothing is listening here.
-	b, err := Probe("127.0.0.1:9", "127.0.0.1:10", 300*time.Millisecond)
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+	defer pc.Close()
+
+	b, err := Probe(pc, "127.0.0.1:9", "127.0.0.1:10", 300*time.Millisecond)
 	if err != nil {
 		t.Fatalf("probe returned an error rather than a finding: %v", err)
 	}
@@ -105,5 +118,44 @@ func TestRingFeasibilityIsACount(t *testing.T) {
 		if got := feasible(c.p, c.o, c.r); got != c.want {
 			t.Errorf("%d permissive, %d ordinary, %d restrictive: got %v, want %v", c.p, c.o, c.r, got, c.want)
 		}
+	}
+}
+
+// The reflexive address must describe the socket that was handed in.
+//
+// This is the property hole punching rests on. A mapping belongs to a source
+// tuple, so telling a peer to aim at an address measured from some other socket
+// points it at a mapping the data will never use. On loopback there is no NAT to
+// translate anything, so the reflexive port must be exactly the local one — and
+// if it is not, the probe is describing a socket other than the caller's.
+func TestTheReflexiveAddressIsAboutTheCallersSocket(t *testing.T) {
+	s, err := Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	primary, alt := s.Addrs()
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+	defer pc.Close()
+
+	b, err := Probe(pc, primary, alt, 2*time.Second)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+
+	_, want, err := net.SplitHostPort(pc.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, got, err := net.SplitHostPort(b.Reflexive)
+	if err != nil {
+		t.Fatalf("reflexive %q: %v", b.Reflexive, err)
+	}
+	if got != want {
+		t.Fatalf("reflexive port %s, but the caller's socket is on %s: the probe measured a different socket", got, want)
 	}
 }

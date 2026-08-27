@@ -162,17 +162,27 @@ type reply struct {
 	From   string `json:"from"` // primary | alt
 }
 
-// Probe measures this machine's behaviour against a rendezvous.
+// Probe measures this machine's behaviour against a rendezvous, on a socket the
+// caller owns.
 //
-// Everything goes out of one socket, because a mapping belongs to a source
+// Everything goes out of that one socket, because a mapping belongs to a source
 // tuple: a second socket would create a second mapping and the comparison would
 // mean nothing.
-func Probe(primary, alt string, timeout time.Duration) (Behaviour, error) {
-	pc, err := net.ListenPacket("udp", ":0")
-	if err != nil {
-		return Behaviour{}, err
+//
+// The socket is the caller's rather than this package's for the same reason,
+// carried one step further. The answer describes the socket it was asked from,
+// so a probe on a socket that is then closed has measured a mapping nothing will
+// ever use. That is adequate for reporting and useless for hole punching, where
+// the whole point is to tell a peer where to aim at *this* socket. Taking it as
+// a parameter is what stops the two from drifting apart silently.
+//
+// Probe reads and writes the socket directly, so it must run before the socket
+// is handed to anything that takes it over — quic.Transport, in particular,
+// documents that ReadFrom and WriteTo are invalid afterwards.
+func Probe(pc net.PacketConn, primary, alt string, timeout time.Duration) (Behaviour, error) {
+	if pc == nil {
+		return Behaviour{}, fmt.Errorf("reach: a probe needs the socket its answer will be about")
 	}
-	defer pc.Close()
 
 	primaryAddr, err := net.ResolveUDPAddr("udp", primary)
 	if err != nil {
@@ -263,7 +273,7 @@ func exchange(pc net.PacketConn, to net.Addr, p probe, timeout time.Duration) (r
 // the one above. A session already knows that address, so nobody has to be told
 // a second one, and there is no round trip to learn it before the measurement
 // that has to happen before joining.
-func ProbeVia(rendezvous string, timeout time.Duration) (Behaviour, error) {
+func ProbeVia(pc net.PacketConn, rendezvous string, timeout time.Duration) (Behaviour, error) {
 	host, portStr, err := net.SplitHostPort(rendezvous)
 	if err != nil {
 		return Behaviour{}, fmt.Errorf("reach: rendezvous address %q: %w", rendezvous, err)
@@ -272,7 +282,7 @@ func ProbeVia(rendezvous string, timeout time.Duration) (Behaviour, error) {
 	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
 		return Behaviour{}, fmt.Errorf("reach: port in %q: %w", rendezvous, err)
 	}
-	return Probe(
+	return Probe(pc,
 		net.JoinHostPort(host, fmt.Sprint(port)),
 		net.JoinHostPort(host, fmt.Sprint(port+1)),
 		timeout,
