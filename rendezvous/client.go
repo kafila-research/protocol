@@ -141,8 +141,18 @@ func (s *Session) Close() error {
 // than an error, and a short timeout here would turn ordinary startup skew into
 // a failure.
 func (s *Session) Dial(to string, timeout time.Duration) (net.Conn, error) {
+	return s.DialStream(to, "", timeout)
+}
+
+// DialStream opens a stream to one of a peer's named listeners.
+//
+// A peer keeps more than one listener open at a time, and the name is how the
+// rendezvous tells them apart. Dial the wrong one and the connection still
+// forms: the bytes simply arrive somewhere that was not expecting them, which
+// no error anywhere will report.
+func (s *Session) DialStream(to, stream string, timeout time.Duration) (net.Conn, error) {
 	conn, _, buffered, err := greet(s.Addr, Hello{
-		Op: "dial", Session: s.ID, From: s.PeerID, To: to,
+		Op: "dial", Session: s.ID, From: s.PeerID, To: to, Stream: stream,
 	}, timeout)
 	if err != nil {
 		return nil, err
@@ -159,9 +169,17 @@ func (s *Session) Dial(to string, timeout time.Duration) (net.Conn, error) {
 // would be blocked dialling a peer that had not accepted yet and the ring would
 // never close. A direct transport hides this, because the kernel completes the
 // handshake whether or not anyone has called Accept.
-func (s *Session) Listen() net.Listener {
+func (s *Session) Listen() net.Listener { return s.ListenStream("") }
+
+// ListenStream accepts the streams opened to this peer under one name.
+//
+// Every listener a peer opens needs its own name. Two on the same name share a
+// queue at the rendezvous, and a dial is then answered by whichever of them
+// reaches the front — including one whose owner has stopped reading it.
+func (s *Session) ListenStream(stream string) net.Listener {
 	l := &relayListener{
 		s:      s,
+		stream: stream,
 		conns:  make(chan net.Conn),
 		closed: make(chan struct{}),
 	}
@@ -178,6 +196,7 @@ const listenBacklog = 2
 
 type relayListener struct {
 	s      *Session
+	stream string
 	conns  chan net.Conn
 	once   sync.Once
 	closed chan struct{}
@@ -216,7 +235,7 @@ func (l *relayListener) park() {
 		var conn net.Conn
 		if err == nil {
 			conn, _, buffered, err = handshake(raw, Hello{
-				Op: "accept", Session: l.s.ID, To: l.s.PeerID,
+				Op: "accept", Session: l.s.ID, To: l.s.PeerID, Stream: l.stream,
 			})
 		}
 		if err != nil {
@@ -328,14 +347,24 @@ func (c *peerConn) RemoteAddr() net.Addr { return relayAddr(c.remote) }
 // error, as a transport must. Nothing here imports the ring — Go's interfaces
 // are structural, so satisfying agent.Transport needs no dependency in either
 // direction.
-type Transport struct{ s *Session }
+type Transport struct {
+	s      *Session
+	stream string
+}
 
 func (s *Session) Transport() *Transport { return &Transport{s: s} }
 
-func (t *Transport) Listen() (net.Listener, error) { return t.s.Listen(), nil }
+// TransportFor is a transport whose listens and dials all name one stream, so
+// a caller that already speaks net.Listener and net.Conn needs to know nothing
+// about streams beyond choosing a name once.
+func (s *Session) TransportFor(stream string) *Transport {
+	return &Transport{s: s, stream: stream}
+}
+
+func (t *Transport) Listen() (net.Listener, error) { return t.s.ListenStream(t.stream), nil }
 
 func (t *Transport) Dial(peer string, timeout time.Duration) (net.Conn, error) {
-	return t.s.Dial(peer, timeout)
+	return t.s.DialStream(peer, t.stream, timeout)
 }
 
 // Events reports session changes pushed by the rendezvous. Host connections

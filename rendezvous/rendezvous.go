@@ -69,6 +69,18 @@ type Hello struct {
 	// them meet.
 	To string `json:"to,omitempty"`
 
+	// Stream separates the listeners a peer keeps open at once, because a peer
+	// is not one endpoint. A node accepts ring frames on one and, if it serves
+	// the interface, HTTP on another; earlier it also took its assignment on a
+	// third. Keyed on the peer alone they share a queue, so a dial is answered
+	// by whichever listener happens to be at the front — the ring's frames go
+	// to the HTTP server, or into a listener nobody reads, and the failure is
+	// silent at both ends.
+	//
+	// Empty is a stream like any other, which is what the ring used before
+	// there was a name for it.
+	Stream string `json:"stream,omitempty"`
+
 	Label string `json:"label,omitempty"`
 
 	// Capability is whatever a member wants the host to know about it, passed
@@ -126,7 +138,7 @@ type session struct {
 	// waiting holds accept-side connections that have arrived before their
 	// dialer, keyed by the accepting peer. A ring starts as several processes
 	// at once and they do not arrive in order.
-	waiting map[string]chan net.Conn
+	waiting map[waitKey]chan net.Conn
 }
 
 // Server pairs machines that cannot accept connections.
@@ -307,7 +319,7 @@ func (s *Server) doHost(conn net.Conn, h Hello, observed string) {
 
 	sess := &session{
 		ID: newID(8), Code: newCode(), Model: h.Model, Members: h.Members,
-		waiting: map[string]chan net.Conn{},
+		waiting: map[waitKey]chan net.Conn{},
 	}
 	hostID := newID(4)
 	sess.Peers = append(sess.Peers, member{
@@ -400,10 +412,11 @@ func (s *Server) doAccept(conn net.Conn, h Hello) {
 	// what gives Accept the blocking semantics a net.Listener is supposed to
 	// have.
 	sess.mu.Lock()
-	ch, ok := sess.waiting[h.To]
+	key := waitKey{peer: h.To, stream: h.Stream}
+	ch, ok := sess.waiting[key]
 	if !ok {
 		ch = make(chan net.Conn, 1)
-		sess.waiting[h.To] = ch
+		sess.waiting[key] = ch
 	}
 	sess.mu.Unlock()
 
@@ -427,10 +440,11 @@ func (s *Server) doDial(conn net.Conn, h Hello) {
 	}
 
 	sess.mu.Lock()
-	ch, ok := sess.waiting[h.To]
+	key := waitKey{peer: h.To, stream: h.Stream}
+	ch, ok := sess.waiting[key]
 	if !ok {
 		ch = make(chan net.Conn, 1)
-		sess.waiting[h.To] = ch
+		sess.waiting[key] = ch
 	}
 	sess.mu.Unlock()
 
@@ -455,7 +469,8 @@ func (s *Server) doDial(conn net.Conn, h Hello) {
 			return
 		}
 		if !parkedAcceptIsAlive(peer) {
-			slog.Debug("rendezvous: discarding a dead parked accept", "session", h.Session, "to", h.To)
+			slog.Debug("rendezvous: discarding a dead parked accept",
+				"session", h.Session, "to", h.To, "stream", h.Stream)
 			peer.Close()
 			continue
 		}
@@ -468,8 +483,16 @@ func (s *Server) doDial(conn net.Conn, h Hello) {
 
 	// Both sides learn they are connected at the same moment, and only then.
 	writeJSON(conn, Welcome{OK: true})
-	slog.Debug("rendezvous: relaying", "session", h.Session, "from", h.From, "to", h.To)
+	slog.Debug("rendezvous: relaying",
+		"session", h.Session, "from", h.From, "to", h.To, "stream", h.Stream)
 	splice(conn, peer, h.From, h.To)
+}
+
+// waitKey is what a dial and an accept must agree on to be paired: which peer,
+// and which of that peer's listeners.
+type waitKey struct {
+	peer   string
+	stream string
 }
 
 // parkedAcceptIsAlive reports whether a waiting acceptor is still there.
