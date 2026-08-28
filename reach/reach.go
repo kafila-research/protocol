@@ -193,6 +193,12 @@ func Probe(pc net.PacketConn, primary, alt string, timeout time.Duration) (Behav
 		return Behaviour{}, fmt.Errorf("reach: alt %q: %w", alt, err)
 	}
 
+	// The socket is on loan. Every deadline set below has to come off before it
+	// goes back, or the next reader inherits one that has already expired and
+	// every read it attempts fails instantly — a socket that looks alive, sends
+	// happily, and silently receives nothing.
+	defer pc.SetReadDeadline(time.Time{})
+
 	b := Behaviour{Mapping: MappingUnknown, Filtering: FilteringUnknown}
 	started := time.Now()
 

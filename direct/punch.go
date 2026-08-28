@@ -137,6 +137,7 @@ func (e *Endpoint) punch(ctx context.Context, targets []string, window time.Dura
 	if len(addrs) == 0 {
 		return "", ErrNoPath
 	}
+	slog.Debug("direct: punching", "from", e.tr.Conn.LocalAddr(), "targets", targets)
 
 	ctx, cancel := context.WithTimeout(ctx, window)
 	defer cancel()
@@ -204,6 +205,7 @@ func (e *Endpoint) listenForPunches(ctx context.Context, heard chan<- string) {
 	for {
 		n, from, err := e.tr.ReadNonQUICPacket(ctx, buf)
 		if err != nil {
+			slog.Debug("direct: stopped listening for punches", "error", err)
 			return
 		}
 		if n < len(punchMagic) || string(buf[:len(punchMagic)]) != string(punchMagic[:]) {
