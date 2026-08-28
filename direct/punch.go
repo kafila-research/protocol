@@ -141,7 +141,7 @@ func (e *Endpoint) punch(ctx context.Context, targets []string, window time.Dura
 	ctx, cancel := context.WithTimeout(ctx, window)
 	defer cancel()
 
-	heard := make(chan string, 1)
+	heard := make(chan string, 4)
 	go e.listenForPunches(ctx, heard)
 
 	// Repeat rather than send once. The first packet out of each side is
@@ -151,17 +151,48 @@ func (e *Endpoint) punch(ctx context.Context, targets []string, window time.Dura
 	tick := time.NewTicker(150 * time.Millisecond)
 	defer tick.Stop()
 
-	for {
+	send := func() {
 		for _, a := range addrs {
 			if _, err := e.tr.WriteTo(punchMagic[:], a); err != nil {
 				slog.Debug("direct: punch send failed", "to", a, "error", err)
 			}
 		}
+	}
+
+	var found string
+	// linger keeps sending after this end is satisfied.
+	//
+	// Stopping the moment a packet arrives is the obvious thing and it starves
+	// the peer: whoever hears first falls silent, and the other end waits out
+	// its whole window hearing nothing. Both ends have to keep punching until
+	// both are done, and neither can know when the other is — so the one that
+	// finishes first keeps going a little longer, which is cheap and removes the
+	// race entirely.
+	const linger = 900 * time.Millisecond
+	var lingerUntil time.Time
+
+	for {
+		send()
 		select {
 		case from := <-heard:
-			return from, nil
+			if found == "" {
+				found = from
+				// Answer immediately as well as on the tick: the peer may be
+				// one packet away from giving up.
+				if a, err := net.ResolveUDPAddr("udp", from); err == nil {
+					_, _ = e.tr.WriteTo(punchMagic[:], a)
+					addrs = append(addrs, a)
+				}
+				lingerUntil = time.Now().Add(linger)
+			}
 		case <-tick.C:
+			if found != "" && time.Now().After(lingerUntil) {
+				return found, nil
+			}
 		case <-ctx.Done():
+			if found != "" {
+				return found, nil
+			}
 			return "", ErrNoPath
 		}
 	}
@@ -180,8 +211,7 @@ func (e *Endpoint) listenForPunches(ctx context.Context, heard chan<- string) {
 		}
 		select {
 		case heard <- from.String():
-		default:
+		default: // already known; the sender does not need telling twice
 		}
-		return
 	}
 }
