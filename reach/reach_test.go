@@ -100,23 +100,41 @@ func TestWhoCanReachWhom(t *testing.T) {
 // machines as restrictive ones, since each restrictive one needs a permissive
 // neighbour on both sides and each permissive one can serve two.
 func TestRingFeasibilityIsACount(t *testing.T) {
-	feasible := func(permissive, ordinary, restrictive int) bool {
-		_ = ordinary // ordinary machines pair with everything except restrictive
-		return permissive >= restrictive
-	}
+	// Calls the real function. The version of this test that shipped first
+	// declared a local copy of the rule and checked that against expectations
+	// derived from the same rule, so it asserted nothing and could not fail —
+	// and it carried {1 permissive, 2 ordinary, 1 restrictive: feasible}, which
+	// is one of the cases the rule was wrong about.
 	cases := []struct {
 		p, o, r int
 		want    bool
 	}{
-		{2, 0, 0, true},
-		{0, 4, 0, true},
-		{1, 2, 1, true},
-		{0, 3, 1, false},
-		{2, 0, 3, false},
+		{2, 0, 0, true},  // nothing restrictive to place
+		{0, 4, 0, true},  // ordinary machines pair with each other
+		{2, 0, 2, true},  // a tight alternation, and nothing to disturb it
+		{1, 2, 1, false}, // the ordinary machines have nowhere to go but beside the restrictive one
+		{2, 1, 1, true},  // one permissive to spare, so the ordinary machine has a home
+		{0, 3, 1, false}, // nothing permissive at all
+		{2, 0, 3, false}, // more restrictive machines than permissive ones
 	}
+
 	for _, c := range cases {
-		if got := feasible(c.p, c.o, c.r); got != c.want {
-			t.Errorf("%d permissive, %d ordinary, %d restrictive: got %v, want %v", c.p, c.o, c.r, got, c.want)
+		classes := map[string]Class{}
+		id := 0
+		add := func(n int, cl Class) {
+			for range n {
+				classes[string(rune('a'+id))] = cl
+				id++
+			}
+		}
+		add(c.p, ClassPermissive)
+		add(c.o, ClassOrdinary)
+		add(c.r, ClassRestrictive)
+
+		got, counts := RingFeasible(classes)
+		if got != c.want {
+			t.Errorf("%d permissive, %d ordinary, %d restrictive: got %v, want %v (counts %+v)",
+				c.p, c.o, c.r, got, c.want, counts)
 		}
 	}
 }
@@ -158,4 +176,76 @@ func TestTheReflexiveAddressIsAboutTheCallersSocket(t *testing.T) {
 	if got != want {
 		t.Fatalf("reflexive port %s, but the caller's socket is on %s: the probe measured a different socket", got, want)
 	}
+}
+
+// The feasibility rule must agree with an exhaustive search over orderings.
+//
+// The first version of it said an all-direct ring exists whenever there are at
+// least as many permissive machines as restrictive ones. That is wrong whenever
+// an ordinary machine is present and the two exactly balance: the ring is then a
+// tight alternation with every permissive adjacency spoken for, and the ordinary
+// machine has nowhere to go but beside a restrictive one.
+//
+// It was found by searching, not by thinking, which is why the search is kept.
+func TestFeasibilityAgreesWithExhaustiveSearch(t *testing.T) {
+	for p := 0; p <= 4; p++ {
+		for m := 0; m <= 3; m++ {
+			for h := 0; h <= 4; h++ {
+				n := p + m + h
+				if n < 3 || n > 7 {
+					continue
+				}
+				ring := make([]Class, 0, n)
+				for range p {
+					ring = append(ring, ClassPermissive)
+				}
+				for range m {
+					ring = append(ring, ClassOrdinary)
+				}
+				for range h {
+					ring = append(ring, ClassRestrictive)
+				}
+
+				classes := map[string]Class{}
+				for i, c := range ring {
+					classes[string(rune('a'+i))] = c
+				}
+				got, counts := RingFeasible(classes)
+
+				if want := anyRingAllDirect(ring); got != want {
+					t.Errorf("P=%d M=%d H=%d: rule says %v, search says %v (counts %+v)",
+						p, m, h, got, want, counts)
+				}
+			}
+		}
+	}
+}
+
+// anyRingAllDirect is true when some ordering has every edge direct.
+func anyRingAllDirect(ring []Class) bool {
+	perm := append([]Class{}, ring...)
+	found := false
+
+	var walk func(at int)
+	walk = func(at int) {
+		if found {
+			return
+		}
+		if at == len(perm) {
+			for i := range perm {
+				if !CanReach(perm[i], perm[(i+1)%len(perm)]) {
+					return
+				}
+			}
+			found = true
+			return
+		}
+		for i := at; i < len(perm); i++ {
+			perm[at], perm[i] = perm[i], perm[at]
+			walk(at + 1)
+			perm[at], perm[i] = perm[i], perm[at]
+		}
+	}
+	walk(0)
+	return found
 }

@@ -329,23 +329,62 @@ func Predict(classes map[string]Class) []Pair {
 }
 
 // RingFeasible reports whether an ordering exists in which every edge is
-// direct, and how many machines force a relay if not.
+// direct, and the counts the answer rests on.
 //
 // A restrictive machine needs a permissive neighbour on both sides, and a
-// permissive machine can serve two of them, so the question is a count: are
-// there at least as many permissive machines as restrictive ones. No search is
-// involved and the answer does not get harder as a session grows.
-func RingFeasible(classes map[string]Class) (feasible bool, permissive, restrictive int) {
+// permissive machine has two sides, so the question looks like a count of the
+// two: are there at least as many permissive machines as restrictive ones. No
+// search is involved and the answer does not get harder as a session grows.
+//
+// # The ordinary machines are not free to place
+//
+// That was the first version of this and it is wrong, which an exhaustive search
+// over every ordering found and no amount of staring would have. Where the
+// permissive and restrictive machines exactly balance, the ring is a tight
+// alternation — restrictive, permissive, restrictive, permissive — and every
+// permissive adjacency is already spoken for. An ordinary machine still has to
+// sit somewhere, and every remaining place is beside a restrictive one, which is
+// the one pairing that cannot be direct.
+//
+// So an ordinary machine anywhere in the session costs a spare permissive
+// machine, and the condition is:
+//
+//   - no restrictive machines: always feasible, since permissive and ordinary
+//     reach each other and themselves
+//   - no ordinary machines: feasible when #permissive >= #restrictive
+//   - otherwise: feasible when #permissive > #restrictive
+//
+// Verified against exhaustive search over every ordering for every mix of
+// classes up to eight members.
+func RingFeasible(classes map[string]Class) (feasible bool, counts Counts) {
 	for _, c := range classes {
 		switch c {
 		case ClassPermissive:
-			permissive++
+			counts.Permissive++
+		case ClassOrdinary:
+			counts.Ordinary++
 		case ClassRestrictive, ClassUnknown:
 			// Unknown counts as restrictive: planning optimistically on a
 			// machine nothing is known about is how a session ends up with an
 			// edge that cannot carry anything.
-			restrictive++
+			counts.Restrictive++
 		}
 	}
-	return permissive >= restrictive, permissive, restrictive
+
+	switch {
+	case counts.Restrictive == 0:
+		return true, counts
+	case counts.Ordinary == 0:
+		return counts.Permissive >= counts.Restrictive, counts
+	default:
+		return counts.Permissive > counts.Restrictive, counts
+	}
+}
+
+// Counts is how many machines of each class a session has, which is the whole
+// of what the feasibility question depends on.
+type Counts struct {
+	Permissive  int
+	Ordinary    int
+	Restrictive int
 }
