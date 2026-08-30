@@ -40,7 +40,30 @@ func greet(addr string, h Hello, timeout time.Duration) (net.Conn, *Welcome, io.
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("rendezvous: dial %s: %w", addr, err)
 	}
-	return handshake(conn, h)
+
+	// The timeout has to cover the reply, not just the connection.
+	//
+	// Reaching the rendezvous is the quick part. A dial is then *parked* until
+	// the peer it names accepts, so the welcome does not arrive until the two
+	// ends have been paired -- which, for a peer that has crashed or is not
+	// listening, is never. Bounding only the TCP connect left the caller waiting
+	// on that indefinitely while holding a timeout it had every reason to
+	// believe applied.
+	if timeout > 0 {
+		_ = conn.SetDeadline(time.Now().Add(timeout))
+	}
+
+	c, w, rest, err := handshake(conn, h)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// Cleared before the connection is handed over. A deadline left on it would
+	// expire under whoever reads it next, and the failure -- reads that stop
+	// working on a connection that was fine a moment ago -- looks like the
+	// network rather than like a leftover.
+	_ = c.SetDeadline(time.Time{})
+	return c, w, rest, nil
 }
 
 // handshake performs the greeting on a connection the caller already holds, so
