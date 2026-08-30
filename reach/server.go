@@ -58,6 +58,29 @@ func Listen(address string) (*Server, error) {
 	return s, nil
 }
 
+// ServeOn answers on sockets the caller already holds.
+//
+// The mirror of Probe taking the caller's socket, and for the same reason: the
+// answer a probe gets is about the path between two particular sockets, so both
+// ends have to be substitutable. Binding them here would make this measurable
+// only over whatever the operating system happens to provide.
+//
+// What that buys is a simulated network. An emulator can hand both ends a
+// PacketConn on a synthetic link with a stated NAT behaviour in between, and the
+// same classifier that runs in the field then runs over the whole RFC 4787
+// matrix -- including the combinations no set of real networks will offer on
+// demand.
+//
+// The two sockets must be reachable at addresses differing only in port, or the
+// filtering test stops meaning what it says: it asks for a reply from somewhere
+// the client has not written to, while everything else stays equal.
+func ServeOn(primary, alt net.PacketConn) *Server {
+	s := &Server{primary: primary, alt: alt}
+	go s.serve(primary, "primary")
+	go s.serve(alt, "alt")
+	return s
+}
+
 // Addrs reports where clients should send, primary first.
 func (s *Server) Addrs() (string, string) {
 	return s.primary.LocalAddr().String(), s.alt.LocalAddr().String()
