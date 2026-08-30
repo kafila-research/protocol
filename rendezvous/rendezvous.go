@@ -55,6 +55,13 @@ type Hello struct {
 	Op string `json:"op"` // host | join | dial | accept
 
 	// host
+	//
+	// Model is what the session intends to run, carried so a joiner can be
+	// told what it is joining. It may be empty: which model a group runs can
+	// depend on which machines turn up, and that is not known when the session
+	// opens. The rendezvous does not interpret it either way -- it introduces
+	// machines to each other and passes bytes between them, and what they do
+	// once introduced is their business.
 	Model   string `json:"model,omitempty"`
 	Members int    `json:"members,omitempty"`
 
@@ -311,8 +318,11 @@ func writeJSON(w io.Writer, v any) {
 }
 
 func (s *Server) doHost(conn net.Conn, h Hello, observed string) {
-	if h.Model == "" || h.Members < 1 {
-		writeJSON(conn, Welcome{Error: "host needs a model and a member count"})
+	// A member count is required because the session is not full until that
+	// many have arrived, and the rendezvous is what counts them. A model is
+	// not: see Hello.Model.
+	if h.Members < 1 {
+		writeJSON(conn, Welcome{Error: "host needs a member count"})
 		conn.Close()
 		return
 	}

@@ -330,3 +330,44 @@ func TestHostLearnsJoinsAndReachesThemThroughTheTransport(t *testing.T) {
 		t.Fatalf("member side: %v", err)
 	}
 }
+
+// Which model a group runs can depend on which machines turn up, so a host may
+// open a session before it has decided. Members still join, and are told the
+// model is not yet settled rather than being told a wrong one.
+func TestASessionOpensBeforeItsModelIsSettled(t *testing.T) {
+	s := start(t)
+
+	host, err := Host(s.Addr(), "", 2, "host-machine")
+	if err != nil {
+		t.Fatalf("host with no model: %v", err)
+	}
+	defer host.Close()
+	if host.Code == "" {
+		t.Fatal("no join code issued")
+	}
+
+	member, err := Join(s.Addr(), host.Code, "friend-machine")
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	defer member.Close()
+
+	if member.ID != host.ID {
+		t.Errorf("member joined session %q, host opened %q", member.ID, host.ID)
+	}
+	if member.Model != "" {
+		t.Errorf("member was told model %q; nothing had been decided", member.Model)
+	}
+	if got := s.Peers(host.ID); len(got) != 2 {
+		t.Errorf("session has %d peers, want 2", len(got))
+	}
+}
+
+// The member count is a different matter: the rendezvous is what counts arrivals
+// against it, so a session cannot open without one.
+func TestASessionStillNeedsToKnowHowManyToExpect(t *testing.T) {
+	s := start(t)
+	if _, err := Host(s.Addr(), "qwen", 0, "host-machine"); err == nil {
+		t.Fatal("opened a session that will never be full")
+	}
+}
