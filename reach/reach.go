@@ -212,8 +212,29 @@ func Probe(pc net.PacketConn, primary, alt string, timeout time.Duration) (Behav
 	b.Evidence.MappedPrimary = r1.Mapped
 	b.Evidence.RoundTripMs = time.Since(started).Milliseconds()
 
-	// 2. What does a different port on the same server see us as? A different
-	//    mapping here means a fresh one per destination.
+	// 2. Ask the primary port to answer from the alt port. Hearing that reply
+	//    means the network admits packets from an address this socket has never
+	//    written to, which is what lets a restrictive peer through.
+	//
+	//    This has to happen before anything is sent to the alt address, and the
+	//    order is the whole test. Sending there first opens a pinhole for that
+	//    exact endpoint, so the reply arrives on any network that keeps state
+	//    per destination -- and every NAT with endpoint-independent mapping then
+	//    reports endpoint-independent filtering, which is to say every one of
+	//    them looks permissive. The distinction being drawn is between a network
+	//    that admits a stranger and one that admits a correspondent, and writing
+	//    first turns the stranger into a correspondent.
+	_, err = exchange(pc, primaryAddr, probe{Token: "f", Alt: true}, timeout)
+	if err == nil {
+		b.Evidence.AltReplyHeard = true
+		b.Filtering = FilteringEndpointIndependent
+	} else {
+		b.Filtering = FilteringPortRestricted
+	}
+
+	// 3. What does a different port on the same server see us as? A different
+	//    mapping here means a fresh one per destination. Safe to do now: it
+	//    contaminates nothing that follows.
 	r2, err := exchange(pc, altAddr, probe{Token: "a", Alt: false}, timeout)
 	if err == nil {
 		b.Evidence.MappedAlt = r2.Mapped
@@ -222,17 +243,6 @@ func Probe(pc net.PacketConn, primary, alt string, timeout time.Duration) (Behav
 		} else {
 			b.Mapping = MappingPortDependent
 		}
-	}
-
-	// 3. Ask the primary port to answer from the alt port. Hearing that reply
-	//    means the network admits packets from an address this socket never
-	//    wrote to, which is what lets a restrictive peer through.
-	_, err = exchange(pc, primaryAddr, probe{Token: "f", Alt: true}, timeout)
-	if err == nil {
-		b.Evidence.AltReplyHeard = true
-		b.Filtering = FilteringEndpointIndependent
-	} else {
-		b.Filtering = FilteringPortRestricted
 	}
 
 	return b, nil
