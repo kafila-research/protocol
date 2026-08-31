@@ -126,7 +126,7 @@ func HostWith(addr, model string, members int, label string, capability []byte) 
 	}
 	return &Session{
 		Addr: addr, ID: w.Session, Code: w.Code, PeerID: w.PeerID,
-		Model: w.Model, Members: w.Members, control: conn,
+		Model: w.Model, Members: w.Members, control: keptAlive(conn),
 	}, nil
 }
 
@@ -146,7 +146,7 @@ func JoinWith(addr, code, label string, capability []byte) (*Session, error) {
 	}
 	return &Session{
 		Addr: addr, ID: w.Session, PeerID: w.PeerID,
-		Model: w.Model, Members: w.Members, control: conn,
+		Model: w.Model, Members: w.Members, control: keptAlive(conn),
 	}, nil
 }
 
@@ -438,4 +438,18 @@ func (s *Session) AwaitPeers(n int, timeout time.Duration) ([]Event, error) {
 		}
 	}
 	return joined, nil
+}
+
+// keptAlive turns on TCP keepalives for a connection that will be held open
+// and mostly silent, and returns it so it can be used inline.
+//
+// A session's control connection is idle from the moment a machine joins until
+// the ring is wired, which on a fleet fetching weights over links of different
+// speeds is minutes. The peer that finishes first waits, says nothing, and is
+// dropped by whatever NAT it sits behind -- and finds out only when it next
+// needs the rendezvous, by which time the error names a timeout rather than a
+// mapping that expired quietly.
+func keptAlive(c net.Conn) net.Conn {
+	keepAlive(c)
+	return c
 }
