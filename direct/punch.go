@@ -2,6 +2,8 @@ package direct
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,45 @@ import (
 // byte avoids the QUIC long-header bit pattern so nothing downstream has to
 // guess.
 var punchMagic = [4]byte{0x2a, 0x4b, 0x46, 0x50} // *KFP
+
+// A punch carries the magic and then the sender's key fingerprint:
+//
+//	*KFP | sha256(sender public key)      4 + 32 bytes
+//
+// The fingerprint is there to say which peer sent the packet, because one
+// socket may be punching to several at once. A node in a ring of more than two
+// arranges both its edges at the same time, and it must: the mapping a punch
+// opens belongs to the socket, so both attempts have to use the one socket, and
+// therefore both see every packet that arrives on it. Without a sender in the
+// packet the two attempts cannot tell their peers apart, and each may take the
+// other's address -- which is worse than failing, since the address is learned
+// and the edge reported direct, and the mistake only appears later when the far
+// end answers with the wrong key.
+//
+// This is a label, not a credential. A fingerprint is public and anyone can put
+// one in a packet; nothing is granted by doing so. What decides whether a path
+// is used is still the TLS handshake against that key (D3), and a punch that
+// lies about its sender achieves nothing beyond making one edge fall back to
+// the relay -- which an attacker on the path could do by dropping packets
+// anyway.
+const punchLen = len(punchMagic) + sha256.Size
+
+// punchFrom writes a punch packet identifying the sender.
+func punchFrom(fingerprint string) ([]byte, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(fingerprint)
+	if err != nil || len(raw) != sha256.Size {
+		return nil, fmt.Errorf("direct: %q is not a key fingerprint", fingerprint)
+	}
+	return append(punchMagic[:], raw...), nil
+}
+
+// punchSender reports which key sent a packet, and whether it was a punch.
+func punchSender(b []byte) (string, bool) {
+	if len(b) < punchLen || string(b[:len(punchMagic)]) != string(punchMagic[:]) {
+		return "", false
+	}
+	return base64.RawURLEncoding.EncodeToString(b[len(punchMagic):punchLen]), true
+}
 
 // Candidate is what one end tells the other about where it can be reached.
 type Candidate struct {
@@ -75,7 +116,7 @@ func Traverse(ctx context.Context, coord net.Conn, e *Endpoint, mine Candidate, 
 		return Peer{}, ErrNoPath
 	}
 
-	addr, err := e.punch(ctx, targets, window)
+	addr, err := e.punch(ctx, targets, window, theirs.Fingerprint)
 	if err != nil {
 		return Peer{}, err
 	}
@@ -124,7 +165,16 @@ func exchange(ctx context.Context, coord net.Conn, mine Candidate) (Candidate, e
 // arrives here. That observed source — ICE calls it peer-reflexive — is what
 // rescues the pairing the prediction expected to fail, so it is preferred over
 // anything in the offer when the two disagree.
-func (e *Endpoint) punch(ctx context.Context, targets []string, window time.Duration) (string, error) {
+//
+// Which is also why an arriving packet cannot be attributed by its address:
+// the whole point is that it may come from somewhere unforeseen. expect is the
+// peer's fingerprint, learned over the coordination stream, and it is what
+// separates this attempt from any other running on the same socket.
+func (e *Endpoint) punch(ctx context.Context, targets []string, window time.Duration, expect string) (string, error) {
+	packet, err := punchFrom(e.id.Fingerprint)
+	if err != nil {
+		return "", err
+	}
 	addrs := make([]net.Addr, 0, len(targets))
 	for _, t := range targets {
 		a, err := net.ResolveUDPAddr("udp", t)
@@ -143,7 +193,8 @@ func (e *Endpoint) punch(ctx context.Context, targets []string, window time.Dura
 	defer cancel()
 
 	heard := make(chan string, 4)
-	go e.listenForPunches(ctx, heard)
+	stop := e.expectPunches(expect, heard)
+	defer stop()
 
 	// Repeat rather than send once. The first packet out of each side is
 	// usually lost by construction — it arrives before the far mapping exists —
@@ -154,7 +205,7 @@ func (e *Endpoint) punch(ctx context.Context, targets []string, window time.Dura
 
 	send := func() {
 		for _, a := range addrs {
-			if _, err := e.tr.WriteTo(punchMagic[:], a); err != nil {
+			if _, err := e.tr.WriteTo(packet, a); err != nil {
 				slog.Debug("direct: punch send failed", "to", a, "error", err)
 			}
 		}
@@ -181,7 +232,7 @@ func (e *Endpoint) punch(ctx context.Context, targets []string, window time.Dura
 				// Answer immediately as well as on the tick: the peer may be
 				// one packet away from giving up.
 				if a, err := net.ResolveUDPAddr("udp", from); err == nil {
-					_, _ = e.tr.WriteTo(punchMagic[:], a)
+					_, _ = e.tr.WriteTo(packet, a)
 					addrs = append(addrs, a)
 				}
 				lingerUntil = time.Now().Add(linger)
@@ -199,17 +250,75 @@ func (e *Endpoint) punch(ctx context.Context, targets []string, window time.Dura
 	}
 }
 
-// listenForPunches reports the source of the first traversal packet to arrive.
-func (e *Endpoint) listenForPunches(ctx context.Context, heard chan<- string) {
+// expectPunches says that this traversal wants the punches sent by expect, and
+// returns the function that withdraws that interest.
+//
+// Registering rather than reading is what makes several attempts on one socket
+// possible. A packet can only be read once, so an attempt that read the socket
+// itself and discarded what was not its own would be destroying the packet the
+// attempt beside it is waiting for -- two edges would starve each other and
+// both fall back to the relay, on a machine where both direct paths were
+// available.
+func (e *Endpoint) expectPunches(expect string, heard chan<- string) func() {
+	e.mu.Lock()
+	e.listening[expect] = heard
+	first := len(e.listening) == 1
+	e.mu.Unlock()
+
+	if first {
+		go e.sortPunches()
+	}
+	return func() {
+		e.mu.Lock()
+		delete(e.listening, expect)
+		e.mu.Unlock()
+	}
+}
+
+// sortPunches reads traversal packets and hands each to whichever attempt is
+// waiting for that sender.
+//
+// One reader for the socket, for as long as anything is traversing. It stops
+// when nothing is left waiting, so a node that is not arranging an edge is not
+// holding a read open on its own data plane.
+func (e *Endpoint) sortPunches() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-e.closed:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	buf := make([]byte, 64)
 	for {
+		e.mu.Lock()
+		waiting := len(e.listening)
+		e.mu.Unlock()
+		if waiting == 0 {
+			return
+		}
+
 		n, from, err := e.tr.ReadNonQUICPacket(ctx, buf)
 		if err != nil {
 			slog.Debug("direct: stopped listening for punches", "error", err)
 			return
 		}
-		if n < len(punchMagic) || string(buf[:len(punchMagic)]) != string(punchMagic[:]) {
+		sender, ok := punchSender(buf[:n])
+		if !ok {
 			continue // something else entirely; not ours to interpret
+		}
+
+		e.mu.Lock()
+		heard := e.listening[sender]
+		e.mu.Unlock()
+		if heard == nil {
+			// Nobody is arranging an edge with that key: a straggler from an
+			// attempt that has finished, or a stranger.
+			slog.Debug("direct: a punch nobody is waiting for", "from", from, "sender", sender)
+			continue
 		}
 		select {
 		case heard <- from.String():
