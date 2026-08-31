@@ -335,6 +335,13 @@ func (s *Server) doHost(conn net.Conn, h Hello, observed string) {
 	sess.Peers = append(sess.Peers, member{
 		ID: hostID, Label: h.Label, Observed: observed, Capability: h.Capability,
 	})
+	// Held open for the session's whole life, and quiet for most of it: the
+	// host says nothing between opening a session and the last member
+	// arriving, and members can be minutes apart when they are fetching
+	// weights over links of different speeds. A NAT that drops an idle mapping
+	// takes the connection with it, and the failure appears later as a
+	// timeout on whatever the host tried to do next.
+	keepAlive(conn)
 	sess.control = conn
 
 	s.mu.Lock()

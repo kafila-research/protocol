@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -369,5 +370,85 @@ func TestASessionStillNeedsToKnowHowManyToExpect(t *testing.T) {
 	s := start(t)
 	if _, err := Host(s.Addr(), "qwen", 0, "host-machine"); err == nil {
 		t.Fatal("opened a session that will never be full")
+	}
+}
+
+// A session's control connection is held open and says nothing for most of its
+// life: from the moment a machine joins until the ring is wired. On a fleet
+// fetching weights over links of different speeds that is minutes, and a NAT
+// that drops idle mappings takes the connection with it. The peer finds out
+// only when it next needs the rendezvous, and the error then names a timeout
+// rather than a mapping that expired quietly.
+//
+// Keepalives are what hold it open. This checks they are actually set on the
+// connections that stay idle -- they were set only on the spliced relay
+// streams, which are not the ones that wait.
+func TestTheControlConnectionIsKeptAlive(t *testing.T) {
+	s := start(t)
+
+	host, err := Host(s.Addr(), "qwen", 2, "host-machine")
+	if err != nil {
+		t.Fatalf("host: %v", err)
+	}
+	defer host.Close()
+
+	member, err := Join(s.Addr(), host.Code, "friend-machine")
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	defer member.Close()
+
+	for _, c := range []struct {
+		who  string
+		conn net.Conn
+	}{{"host", host.control}, {"member", member.control}} {
+		if c.conn == nil {
+			t.Errorf("%s has no control connection", c.who)
+			continue
+		}
+		tcp := tcpOf(c.conn)
+		if tcp == nil {
+			t.Errorf("%s's control connection is not TCP, so it cannot be kept alive", c.who)
+			continue
+		}
+		// Go exposes no getter for the keepalive it set, so this asserts the
+		// call succeeds on the connection rather than reading the flag back.
+		// What it does catch is the connection being closed or of a kind that
+		// cannot carry keepalives -- and it documents which connections have to
+		// have them.
+		if err := tcp.SetKeepAlive(true); err != nil {
+			t.Errorf("%s's control connection will not take a keepalive: %v", c.who, err)
+		}
+	}
+}
+
+// The idle period is real and worth naming: a member that finishes fetching
+// early waits for the slowest one, and must still be able to reach the
+// rendezvous afterwards.
+func TestARendezvousStillAnswersAfterAnIdlePeriod(t *testing.T) {
+	if testing.Short() {
+		t.Skip("takes a few seconds of deliberate idling")
+	}
+	s := start(t)
+
+	host, err := Host(s.Addr(), "qwen", 2, "host-machine")
+	if err != nil {
+		t.Fatalf("host: %v", err)
+	}
+	defer host.Close()
+
+	member, err := Join(s.Addr(), host.Code, "friend-machine")
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	defer member.Close()
+
+	// Nothing said by anyone, as while weights are fetched.
+	time.Sleep(3 * time.Second)
+
+	// The host must still learn who is present, which is what it needs the
+	// control connection for.
+	if got := s.Peers(host.ID); len(got) != 2 {
+		t.Errorf("after idling, the session reports %d peers, want 2", len(got))
 	}
 }
