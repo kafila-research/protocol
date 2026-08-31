@@ -165,3 +165,90 @@ func TestNoReachableCandidateMeansNoPathRatherThanAnError(t *testing.T) {
 		t.Fatalf("error was %v, which a caller cannot tell apart from a broken edge; want ErrNoPath", err)
 	}
 }
+
+// A node in a ring of more than two traverses to both its neighbours at once,
+// on one socket, because the mapping a punch opens belongs to that socket and
+// no other. Both attempts therefore see every punch packet that arrives.
+//
+// Each must come back with its own peer's address. Getting the other's is worse
+// than failing: the address is learned, the edge is reported direct, and the
+// mistake only surfaces later when the far end answers with the wrong key and
+// the connection is dropped -- so the edge is relayed for a reason that has
+// nothing to do with whether a direct path existed.
+func TestConcurrentTraversalsDoNotTakeEachOthersPeers(t *testing.T) {
+	middle, mid := endpoint(t)
+	left, lid := endpoint(t)
+	right, rid := endpoint(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Two coordination streams, as a ring node has: one to each neighbour.
+	toLeftA, toLeftB := net.Pipe()
+	toRightA, toRightB := net.Pipe()
+	defer toLeftA.Close()
+	defer toLeftB.Close()
+	defer toRightA.Close()
+	defer toRightB.Close()
+
+	cand := func(e *Endpoint, id *Identity) Candidate {
+		return Candidate{Local: e.LocalAddr().String(), Fingerprint: id.Fingerprint}
+	}
+
+	type result struct {
+		peer Peer
+		err  error
+	}
+	gotLeft := make(chan result, 1)
+	gotRight := make(chan result, 1)
+
+	// The middle node, traversing to both neighbours on one endpoint.
+	go func() {
+		p, err := Traverse(ctx, toLeftA, middle, cand(middle, mid), 10*time.Second)
+		gotLeft <- result{p, err}
+	}()
+	go func() {
+		p, err := Traverse(ctx, toRightA, middle, cand(middle, mid), 10*time.Second)
+		gotRight <- result{p, err}
+	}()
+	// The neighbours, each traversing to the middle.
+	go func() { _, _ = Traverse(ctx, toLeftB, left, cand(left, lid), 10*time.Second) }()
+	go func() { _, _ = Traverse(ctx, toRightB, right, cand(right, rid), 10*time.Second) }()
+
+	var l, r result
+	select {
+	case l = <-gotLeft:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the traversal to the left neighbour never finished")
+	}
+	select {
+	case r = <-gotRight:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the traversal to the right neighbour never finished")
+	}
+	if l.err != nil {
+		t.Fatalf("traversing to the left neighbour: %v", l.err)
+	}
+	if r.err != nil {
+		t.Fatalf("traversing to the right neighbour: %v", r.err)
+	}
+
+	// The address each attempt found must be the socket of the peer it was
+	// arranging with -- the fingerprint says which peer that is.
+	for _, c := range []struct {
+		side string
+		got  Peer
+		want *Endpoint
+	}{
+		{"left", l.peer, left},
+		{"right", r.peer, right},
+	} {
+		if c.got.Addr != c.want.LocalAddr().String() {
+			t.Errorf("the %s edge learned %s; that neighbour is at %s",
+				c.side, c.got.Addr, c.want.LocalAddr())
+		}
+	}
+	if l.peer.Addr == r.peer.Addr {
+		t.Errorf("both edges learned the same address %s, so at least one is the wrong peer", l.peer.Addr)
+	}
+}

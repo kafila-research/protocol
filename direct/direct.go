@@ -156,6 +156,12 @@ type Endpoint struct {
 	accepted chan acceptedStream
 	closed   chan struct{}
 	once     sync.Once
+
+	// listening is which traversal is waiting for which peer's punches, by
+	// that peer's fingerprint. One socket carries every edge this node is
+	// arranging at once, so the packets have to be sorted out in one place --
+	// see punch.go.
+	listening map[string]chan<- string
 }
 
 type acceptedStream struct {
@@ -174,12 +180,13 @@ func New(pc net.PacketConn, id *Identity, peers map[string]Peer) (*Endpoint, err
 		return nil, errors.New("direct: an endpoint needs an identity")
 	}
 	e := &Endpoint{
-		id:       id,
-		tr:       &quic.Transport{Conn: pc},
-		peers:    map[string]Peer{},
-		conns:    map[string]*quic.Conn{},
-		accepted: make(chan acceptedStream),
-		closed:   make(chan struct{}),
+		id:        id,
+		tr:        &quic.Transport{Conn: pc},
+		peers:     map[string]Peer{},
+		conns:     map[string]*quic.Conn{},
+		accepted:  make(chan acceptedStream),
+		closed:    make(chan struct{}),
+		listening: map[string]chan<- string{},
 	}
 	for k, v := range peers {
 		e.peers[k] = v
