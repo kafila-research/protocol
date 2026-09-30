@@ -163,3 +163,80 @@ func TestAnImpostorAtTheRightAddressIsRefused(t *testing.T) {
 		t.Fatal("the test generated the same key twice, which makes it prove nothing")
 	}
 }
+
+// Connecting after a punch holds the path open without handing the far end a
+// stream: its ring sees only the streams dialled for it, and a later dial
+// rides the connection already made.
+func TestConnectHoldsThePathWithoutAStream(t *testing.T) {
+	a, aid := endpoint(t)
+	b, bid := endpoint(t)
+	introduce(a, "b", b, bid)
+	introduce(b, "a", a, aid)
+
+	if err := a.Connect("b", 10*time.Second); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	a.mu.Lock()
+	held := a.conns["b"]
+	a.mu.Unlock()
+	if held == nil {
+		t.Fatal("connect kept no connection")
+	}
+	if err := a.Connect("b", 10*time.Second); err != nil {
+		t.Fatalf("connecting again: %v", err)
+	}
+
+	bln, err := b.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan []byte, 2)
+	go func() {
+		for {
+			conn, err := bln.Accept()
+			if err != nil {
+				return
+			}
+			buf := make([]byte, 5)
+			_, _ = io.ReadFull(conn, buf)
+			conn.Close()
+			got <- buf
+		}
+	}()
+	select {
+	case b := <-got:
+		t.Fatalf("connecting handed the far end a stream (%q)", b)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	conn, err := a.Dial("b", 10*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	select {
+	case b := <-got:
+		if !bytes.Equal(b, []byte("hello")) {
+			t.Fatalf("b received %q", b)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("nothing reached b")
+	}
+	a.mu.Lock()
+	used := a.conns["b"]
+	a.mu.Unlock()
+	if used != held {
+		t.Error("the dial made a second connection instead of using the one held")
+	}
+}
+
+// Connecting to a peer nobody has introduced fails rather than guessing.
+func TestConnectNeedsAnAddress(t *testing.T) {
+	a, _ := endpoint(t)
+	if err := a.Connect("nobody", time.Second); err == nil {
+		t.Fatal("connected to a peer with no known address")
+	}
+}
