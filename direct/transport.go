@@ -55,6 +55,32 @@ func (e *Endpoint) Dial(peer string, timeout time.Duration) (net.Conn, error) {
 	return &streamConn{Stream: s, local: conn.LocalAddr(), remote: conn.RemoteAddr()}, nil
 }
 
+// Connect makes the connection later dials to peer will use, without opening
+// a stream on it.
+//
+// A punch opens a path through each end's NAT that lasts only while packets
+// keep crossing it, commonly about thirty seconds. A ring dials its successor
+// once it has finished loading, which can be a minute or more after the punch,
+// and by then the path traversal proved has closed: a node dialling 47 s after
+// its punch timed out and had to be relayed. Connecting as soon as the punch
+// succeeds puts QUIC's keepalives on the path from then on, so it is still
+// open when the ring needs it, and proves the path carries a handshake while
+// the relay is still the fallback rather than the rescue.
+func (e *Endpoint) Connect(peer string, timeout time.Duration) error {
+	e.mu.Lock()
+	p, known := e.peers[peer]
+	conn := e.conns[peer]
+	e.mu.Unlock()
+	if !known {
+		return fmt.Errorf("direct: no address known for %s", peer)
+	}
+	if conn != nil && conn.Context().Err() == nil {
+		return nil
+	}
+	_, err := e.connect(peer, p, timeout)
+	return err
+}
+
 func (e *Endpoint) connect(peer string, p Peer, timeout time.Duration) (*quic.Conn, error) {
 	addr, err := net.ResolveUDPAddr("udp", p.Addr)
 	if err != nil {
@@ -80,7 +106,7 @@ func (e *Endpoint) connect(peer string, p Peer, timeout time.Duration) (*quic.Co
 	// close the loser rather than leaving both alive, so a peer is reached the
 	// same way in both directions.
 	e.mu.Lock()
-	if existing, ok := e.conns[peer]; ok && existing != nil {
+	if existing, ok := e.conns[peer]; ok && existing != nil && existing.Context().Err() == nil {
 		e.mu.Unlock()
 		_ = conn.CloseWithError(0, "duplicate")
 		return existing, nil
