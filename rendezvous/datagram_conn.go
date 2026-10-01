@@ -11,38 +11,30 @@ import (
 
 // Relayed datagrams: the member side.
 //
-// SKELETON. This file declares the member's end of the datagram relay
-// (datagrams.go) and the API Kafila builds on. The implementation is to be
-// written separately and reviewed against the tests in datagrams_test.go.
-// Until it is, Datagrams returns ErrNoDatagrams and callers relay over TCP.
-//
 // A DatagramConn is a net.PacketConn whose packets travel through the
 // rendezvous to other members of this session, so that a QUIC endpoint
 // (protocol/direct) can run over it unchanged: same identities, same pinned
 // keys, a different route for the packets.
 //
-// # What it must do
+// Packets sent to the rendezvous are framed with one-byte opcodes and
+// length-prefixed fields that match datagrams.go:
 //
-//   - Open one UDP socket of its own and send to the rendezvous's UDP port,
-//     which is the port number of Session.Addr (the behaviour probe's primary
-//     port).
-//   - Register with the session ID, this member's peer ID and its RelayToken,
-//     and wait up to the timeout given to Datagrams for the relay to
-//     acknowledge. No acknowledgement, a rendezvous that issued no token, or
-//     UDP that does not get through, is ErrNoDatagrams: the caller relays
-//     over TCP instead. Register again every few seconds while open, which
-//     keeps the registration and this machine's NAT mapping alive.
-//   - Give each peer a stand-in address (AddrOf) that is a valid *net.UDPAddr
-//     in a range never routed (198.18.0.0/15), stable for the life of the
-//     conn and distinct per peer, so that QUIC can address peers by it.
-//     WriteTo sends to the peer a stand-in address names; ReadFrom returns
-//     packets with the stand-in address of the member they came from.
-//   - Ignore anything on the socket that does not come from the rendezvous or
-//     is not a relayed packet, and never hand QUIC the relay's framing.
-//   - Honour the deadline methods as a net.PacketConn must, since quic-go
-//     relies on them, and stop registering when closed.
+//   - register: 1, session, peer, relay-token.
+//   - ack: 2.
+//   - to-peer: 3, destination-peer, payload.
+//   - from-peer: 4, source-peer, payload.
 //
-// The framing is the implementer's to choose, and must match datagrams.go.
+// Datagrams opens one UDP socket, registers with the relay, and waits up to
+// the caller's timeout for an ack. When none arrives, or when no relay token
+// was issued, it returns ErrNoDatagrams so callers can fall back to TCP relay.
+// While open, DatagramConn re-registers every datagramRegisterInterval to keep
+// both relay registration and NAT mapping alive, and stops on Close.
+//
+// AddrOf provides stable per-peer stand-in UDP addresses in 198.18.0.0/15 for
+// the conn's lifetime. WriteTo resolves stand-ins back to peer IDs and sends to
+// the rendezvous; ReadFrom accepts only relayed packets from that rendezvous and
+// returns payload plus the sender's stand-in address. Deadline methods delegate
+// to the underlying socket, which keeps net.PacketConn semantics quic-go needs.
 
 const (
 	datagramRegisterInterval = 3 * time.Second
@@ -70,6 +62,9 @@ type DatagramConn struct {
 	standinByPeer map[string]*net.UDPAddr
 	peerByStandin map[string]string
 	nextStandin   uint32
+
+	readMu  sync.Mutex
+	readBuf []byte
 }
 
 // Datagrams opens this member's datagram relay, waiting up to timeout for the
@@ -96,6 +91,7 @@ func (s *Session) Datagrams(timeout time.Duration) (*DatagramConn, error) {
 		done:          make(chan struct{}),
 		standinByPeer: map[string]*net.UDPAddr{},
 		peerByStandin: map[string]string{},
+		readBuf:       make([]byte, 65536),
 	}
 
 	if err := c.awaitAck(timeout); err != nil {
@@ -227,16 +223,18 @@ func parseRelayedDatagram(frame []byte) (string, []byte, bool) {
 // ReadFrom reads the next packet relayed to this member, and the stand-in
 // address of the member that sent it.
 func (c *DatagramConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	buf := make([]byte, 65536)
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
 	for {
-		n, from, err := c.pc.ReadFrom(buf)
+		n, from, err := c.pc.ReadFrom(c.readBuf)
 		if err != nil {
 			return 0, nil, err
 		}
 		if !udpAddrEqual(from, c.relay) {
 			continue
 		}
-		peer, payload, ok := parseRelayedDatagram(buf[:n])
+		peer, payload, ok := parseRelayedDatagram(c.readBuf[:n])
 		if !ok {
 			continue
 		}
