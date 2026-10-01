@@ -237,8 +237,7 @@ func (r *datagramRelay) handle(pc net.PacketConn, b []byte, from net.Addr) {
 			return
 		}
 
-		frame := make([]byte, 0, 2+len(sender.peer)+len(payload))
-		frame = append(frame, datagramFrameFromPeer)
+		frame := []byte{datagramFrameFromPeer}
 		frame = appendDatagramField(frame, sender.peer)
 		frame = append(frame, payload...)
 		r.enqueueWrite(pc, receiver.addr, frame)

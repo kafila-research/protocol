@@ -259,8 +259,7 @@ func (c *DatagramConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		return 0, net.InvalidAddrError("rendezvous: destination is not one of this session's stand-in addresses")
 	}
 
-	frame := make([]byte, 0, 2+len(peer)+len(p))
-	frame = append(frame, datagramFrameToPeer)
+	frame := []byte{datagramFrameToPeer}
 	frame = appendDatagramField(frame, peer)
 	frame = append(frame, p...)
 
