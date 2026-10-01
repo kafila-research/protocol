@@ -119,6 +119,12 @@ type Welcome struct {
 	PeerID  string `json:"peerID,omitempty"`
 	Model   string `json:"model,omitempty"`
 	Members int    `json:"members,omitempty"`
+
+	// RelayToken is this member's own key to the datagram relay
+	// (datagrams.go): a peer registering to receive datagrams must present
+	// it, so knowing a session's ID is not enough to take another member's
+	// traffic. Absent from a rendezvous that relays no datagrams.
+	RelayToken string `json:"relayToken,omitempty"`
 }
 
 type member struct {
@@ -129,6 +135,9 @@ type member struct {
 	// address worth believing. A self-reported one is wrong behind NAT and a
 	// lie from anyone hostile.
 	Observed string
+
+	// Token is what this member registers for relayed datagrams with.
+	Token string
 }
 
 type session struct {
@@ -156,6 +165,8 @@ type Server struct {
 
 	ln    net.Listener
 	reach *reach.Server
+
+	datagrams *datagramRelay
 }
 
 func NewServer() *Server {
@@ -216,7 +227,17 @@ func (s *Server) Serve(ln net.Listener) error {
 	// Failing to bind is not fatal. The probe is instrumentation; a session
 	// forms and serves without it, and losing the measurement is better than
 	// losing the session.
-	if rs, err := reach.Listen(ln.Addr().String()); err != nil {
+	//
+	// Relayed datagrams share the primary probe port (datagrams.go), so a
+	// rendezvous that answers probes relays datagrams with no port of its own
+	// to open.
+	s.mu.Lock()
+	if s.datagrams == nil {
+		s.datagrams = newDatagramRelay(s.memberToken)
+	}
+	relay := s.datagrams
+	s.mu.Unlock()
+	if rs, err := reach.ListenWith(ln.Addr().String(), relay.handle); err != nil {
 		slog.Warn("behaviour probes unavailable; sessions will still form", "error", err)
 	} else {
 		s.mu.Lock()
@@ -332,8 +353,9 @@ func (s *Server) doHost(conn net.Conn, h Hello, observed string) {
 		waiting: map[waitKey]chan net.Conn{},
 	}
 	hostID := newID(4)
+	hostToken := newID(16)
 	sess.Peers = append(sess.Peers, member{
-		ID: hostID, Label: h.Label, Observed: observed, Capability: h.Capability,
+		ID: hostID, Label: h.Label, Observed: observed, Capability: h.Capability, Token: hostToken,
 	})
 	// Held open for the session's whole life, and quiet for most of it: the
 	// host says nothing between opening a session and the last member
@@ -353,7 +375,7 @@ func (s *Server) doHost(conn net.Conn, h Hello, observed string) {
 		"model", sess.Model, "members", sess.Members)
 	writeJSON(conn, Welcome{
 		OK: true, Session: sess.ID, Code: sess.Code, PeerID: hostID,
-		Model: sess.Model, Members: sess.Members,
+		Model: sess.Model, Members: sess.Members, RelayToken: hostToken,
 	})
 	// The control connection stays open for the session's lifetime so the
 	// rendezvous can push — a member joining, a departure — without the host
@@ -371,9 +393,9 @@ func (s *Server) doJoin(conn net.Conn, h Hello, observed string) {
 	}
 
 	sess.mu.Lock()
-	id := newID(4)
+	id, token := newID(4), newID(16)
 	sess.Peers = append(sess.Peers, member{
-		ID: id, Label: h.Label, Observed: observed, Capability: h.Capability,
+		ID: id, Label: h.Label, Observed: observed, Capability: h.Capability, Token: token,
 	})
 	n := len(sess.Peers)
 	control := sess.control
@@ -391,8 +413,27 @@ func (s *Server) doJoin(conn net.Conn, h Hello, observed string) {
 	}
 	writeJSON(conn, Welcome{
 		OK: true, Session: sess.ID, PeerID: id,
-		Model: sess.Model, Members: sess.Members,
+		Model: sess.Model, Members: sess.Members, RelayToken: token,
 	})
+}
+
+// memberToken is the relay token issued to peer in session, and whether that
+// peer is a member of it at all.
+func (s *Server) memberToken(sessionID, peer string) (string, bool) {
+	s.mu.Lock()
+	sess := s.sessions[sessionID]
+	s.mu.Unlock()
+	if sess == nil {
+		return "", false
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	for _, p := range sess.Peers {
+		if p.ID == peer {
+			return p.Token, true
+		}
+	}
+	return "", false
 }
 
 // Peers reports who is in a session, for the host's planner.

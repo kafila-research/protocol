@@ -16,11 +16,20 @@ import (
 // does and would have nothing to say about its filtering.
 type Server struct {
 	primary, alt net.PacketConn
+
+	// other takes what arrives on the primary port that is not a probe. A
+	// probe is JSON and so starts with '{'; anything else on the port is
+	// another service's, sharing it so that it needs no port of its own.
+	other func(pc net.PacketConn, b []byte, from net.Addr)
 }
 
 // Listen binds both ports. The alt port is the one after the primary, which
 // keeps deployment to a single decision and a single firewall rule.
-func Listen(address string) (*Server, error) {
+func Listen(address string) (*Server, error) { return ListenWith(address, nil) }
+
+// ListenWith is Listen, handing other every packet on the primary port that
+// is not a probe. other runs on the reading goroutine and must not keep b.
+func ListenWith(address string, other func(pc net.PacketConn, b []byte, from net.Addr)) (*Server, error) {
 	primary, err := net.ListenPacket("udp", address)
 	if err != nil {
 		return nil, fmt.Errorf("reach: listen on %s: %w", address, err)
@@ -51,7 +60,7 @@ func Listen(address string) (*Server, error) {
 		return nil, fmt.Errorf("reach: no free alt port near %d: %w", bound.Port, err)
 	}
 
-	s := &Server{primary: primary, alt: alt}
+	s := &Server{primary: primary, alt: alt, other: other}
 	go s.serve(primary, "primary")
 	go s.serve(alt, "alt")
 	slog.Info("behaviour probe listening", "primary", primary.LocalAddr(), "alt", alt.LocalAddr())
@@ -92,11 +101,17 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) serve(pc net.PacketConn, name string) {
-	buf := make([]byte, 1500)
+	buf := make([]byte, 65536)
 	for {
 		n, from, err := pc.ReadFrom(buf)
 		if err != nil {
 			return
+		}
+		if n > 0 && buf[0] != '{' {
+			if s.other != nil && name == "primary" {
+				s.other(pc, buf[:n], from)
+			}
+			continue
 		}
 		var p probe
 		if json.Unmarshal(buf[:n], &p) != nil {
