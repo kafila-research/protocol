@@ -1,14 +1,14 @@
 package rendezvous
 
-import "net"
+import (
+	"crypto/hmac"
+	"log/slog"
+	"net"
+	"sync"
+	"time"
+)
 
 // Relayed datagrams: the server side.
-//
-// SKELETON. This file declares what the rendezvous's datagram relay must do
-// and the names the rest of the package already calls. The implementation is
-// to be written separately and reviewed against the tests in
-// datagrams_test.go. Until it is, handle drops everything, members' Datagrams
-// calls fail, and Kafila falls back to relaying rings over TCP as before.
 //
 // # Why it exists
 //
@@ -22,29 +22,47 @@ import "net"
 // keys they exchanged through the host; the relay neither reads nor alters
 // what they carry.
 //
-// # What it must do
+// The relay shares the probe's primary UDP socket, so every relay packet starts
+// with a non-JSON opcode byte and never with '{'. Frames then carry
+// length-prefixed fields (one-byte length, then bytes):
 //
-//   - Share the behaviour probe's primary UDP port. reach.ListenWith hands
-//     handle every packet on that port that is not a probe; probes are JSON,
-//     so a relay packet must never begin with '{'.
-//   - Let a member register the UDP address it sends from, by presenting its
-//     session ID, its peer ID and the RelayToken the rendezvous issued it at
-//     host or join. Check the token with the token function given to
-//     newDatagramRelay, in constant time, and acknowledge a good registration
-//     so the member knows the relay is there. Ignore a bad one.
-//   - Forward a member's packet to the member it names, only if both are
-//     registered in the same session. The sender is identified by the address
-//     the packet arrived from, never by anything it claims; the receiver is
-//     told which member it came from.
-//   - Forget a registration that has been idle for a while (members register
-//     again periodically, which also keeps their NAT mappings open), and let a
-//     member register again from a new address when its network changes.
-//   - Never block the reading goroutine, never keep the packet buffer past
-//     the call, and stay quiet in the logs at the info level: this carries
-//     every token of every relayed ring.
+//   - register: 1, session, peer, relay-token.
+//   - ack: 2.
+//   - to-peer: 3, destination-peer, payload.
+//   - from-peer: 4, source-peer, payload.
 //
-// The framing is the implementer's to choose, and must match DatagramConn in
-// datagram_conn.go.
+// Registrations are keyed by member and by source address, expire after
+// datagramRegistrationTTL of inactivity, and can be replaced when a member
+// registers again from a new address. Only packets that arrive from a member
+// refresh its liveness. Expiry sweeps run at most once each
+// datagramRegistrationSweepInterval so every packet does not pay an O(n) scan.
+//
+// handle runs on the socket's reading goroutine, so it only parses and updates
+// tables inline, then enqueues any write without blocking. Packet contents that
+// come from the shared read buffer are copied before they can outlive the call.
+
+const (
+	datagramFrameRegister byte = 1
+	datagramFrameAck      byte = 2
+	datagramFrameToPeer   byte = 3
+	datagramFrameFromPeer byte = 4
+
+	datagramRegistrationTTL           = 12 * time.Second
+	datagramRegistrationSweepInterval = time.Second
+)
+
+type relayRegistration struct {
+	session string
+	peer    string
+	addr    net.Addr
+	seen    time.Time
+}
+
+type relayWrite struct {
+	pc   net.PacketConn
+	to   net.Addr
+	data []byte
+}
 
 // datagramRelay is the rendezvous's datagram relay.
 type datagramRelay struct {
@@ -52,18 +70,170 @@ type datagramRelay struct {
 	// whether that peer is a member of it (Server.memberToken).
 	token func(session, peer string) (string, bool)
 
-	// TODO: registrations, keyed both by member and by the address it
-	// registered from, with when each was last heard.
+	mu        sync.Mutex
+	byMember  map[string]*relayRegistration
+	byAddr    map[string]*relayRegistration
+	lastSweep time.Time
+	writes    chan relayWrite
 }
 
 // newDatagramRelay is a relay that checks registrations with token.
 func newDatagramRelay(token func(session, peer string) (string, bool)) *datagramRelay {
-	return &datagramRelay{token: token}
+	r := &datagramRelay{
+		token:    token,
+		byMember: map[string]*relayRegistration{},
+		byAddr:   map[string]*relayRegistration{},
+		writes:   make(chan relayWrite, 256),
+	}
+	go r.writeLoop()
+	return r
+}
+
+func (r *datagramRelay) writeLoop() {
+	for w := range r.writes {
+		if _, err := w.pc.WriteTo(w.data, w.to); err != nil {
+			slog.Debug("rendezvous datagram write failed", "to", w.to, "error", err)
+		}
+	}
+}
+
+func (r *datagramRelay) enqueueWrite(pc net.PacketConn, to net.Addr, data []byte) {
+	select {
+	case r.writes <- relayWrite{pc: pc, to: cloneAddr(to), data: data}:
+	default:
+		slog.Debug("rendezvous datagram write queue full", "to", to)
+	}
+}
+
+func relayMemberKey(session, peer string) string { return session + "\x00" + peer }
+
+func (r *datagramRelay) expire(now time.Time) {
+	for memberKey, reg := range r.byMember {
+		if now.Sub(reg.seen) <= datagramRegistrationTTL {
+			continue
+		}
+		delete(r.byMember, memberKey)
+		if current := r.byAddr[reg.addr.String()]; current == reg {
+			delete(r.byAddr, reg.addr.String())
+		}
+	}
+}
+
+func (r *datagramRelay) expireIfDue(now time.Time) {
+	if now.Sub(r.lastSweep) < datagramRegistrationSweepInterval {
+		return
+	}
+	r.expire(now)
+	r.lastSweep = now
+}
+
+func parseDatagramField(frame []byte, at *int) (string, bool) {
+	if *at >= len(frame) {
+		return "", false
+	}
+	n := int(frame[*at])
+	*at++
+	if n > len(frame)-*at {
+		return "", false
+	}
+	s := string(frame[*at : *at+n])
+	*at += n
+	return s, true
+}
+
+func appendDatagramField(dst []byte, s string) []byte {
+	if len(s) > 255 {
+		s = s[:255]
+	}
+	dst = append(dst, byte(len(s)))
+	return append(dst, s...)
+}
+
+func cloneAddr(addr net.Addr) net.Addr {
+	u, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return addr
+	}
+	cpy := &net.UDPAddr{Port: u.Port, Zone: u.Zone}
+	if u.IP != nil {
+		cpy.IP = append(net.IP(nil), u.IP...)
+	}
+	return cpy
 }
 
 // handle takes one packet that arrived on the probe's primary port from from,
 // and is not a probe. It runs on the port's reading goroutine; b is reused
 // after it returns.
 func (r *datagramRelay) handle(pc net.PacketConn, b []byte, from net.Addr) {
-	// TODO: registration, acknowledgement and forwarding, as above.
+	if len(b) == 0 {
+		return
+	}
+	now := time.Now()
+
+	switch b[0] {
+	case datagramFrameRegister:
+		at := 1
+		session, ok := parseDatagramField(b, &at)
+		if !ok {
+			return
+		}
+		peer, ok := parseDatagramField(b, &at)
+		if !ok {
+			return
+		}
+		token, ok := parseDatagramField(b, &at)
+		if !ok || at != len(b) {
+			return
+		}
+
+		want, member := r.token(session, peer)
+		if !member || !hmac.Equal([]byte(token), []byte(want)) {
+			return
+		}
+
+		reg := &relayRegistration{session: session, peer: peer, addr: cloneAddr(from), seen: now}
+		memberKey := relayMemberKey(session, peer)
+		addrKey := from.String()
+
+		r.mu.Lock()
+		r.expireIfDue(now)
+		if old, ok := r.byMember[memberKey]; ok {
+			delete(r.byAddr, old.addr.String())
+		}
+		if old, ok := r.byAddr[addrKey]; ok {
+			delete(r.byMember, relayMemberKey(old.session, old.peer))
+		}
+		r.byMember[memberKey] = reg
+		r.byAddr[addrKey] = reg
+		r.mu.Unlock()
+
+		r.enqueueWrite(pc, from, []byte{datagramFrameAck})
+
+	case datagramFrameToPeer:
+		at := 1
+		toPeer, ok := parseDatagramField(b, &at)
+		if !ok {
+			return
+		}
+		payload := b[at:]
+
+		r.mu.Lock()
+		r.expireIfDue(now)
+		sender := r.byAddr[from.String()]
+		if sender == nil {
+			r.mu.Unlock()
+			return
+		}
+		sender.seen = now
+		receiver := r.byMember[relayMemberKey(sender.session, toPeer)]
+		r.mu.Unlock()
+		if receiver == nil {
+			return
+		}
+
+		frame := []byte{datagramFrameFromPeer}
+		frame = appendDatagramField(frame, sender.peer)
+		frame = append(frame, payload...)
+		r.enqueueWrite(pc, receiver.addr, frame)
+	}
 }

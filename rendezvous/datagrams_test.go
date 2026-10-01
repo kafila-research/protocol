@@ -66,6 +66,33 @@ func readWithin(c *DatagramConn, d time.Duration) ([]byte, net.Addr, error) {
 	return buf[:n], from, nil
 }
 
+func registerDatagramReceiver(t *testing.T, sess *Session, pc net.PacketConn) {
+	t.Helper()
+
+	relay, err := net.ResolveUDPAddr("udp", sess.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := []byte{datagramFrameRegister}
+	frame = appendDatagramField(frame, sess.ID)
+	frame = appendDatagramField(frame, sess.PeerID)
+	frame = appendDatagramField(frame, sess.RelayToken)
+	if _, err := pc.WriteTo(frame, relay); err != nil {
+		t.Fatal(err)
+	}
+
+	var ack [16]byte
+	_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	defer pc.SetReadDeadline(time.Time{})
+	n, _, err := pc.ReadFrom(ack[:])
+	if err != nil {
+		t.Fatalf("registration ack: %v", err)
+	}
+	if n == 0 || ack[0] != datagramFrameAck {
+		t.Fatalf("registration ack frame %v", ack[:n])
+	}
+}
+
 // A packet reaches the member it names, both ways, and arrives from the
 // stand-in address of the member that sent it.
 func TestDatagramsReachTheMemberNamed(t *testing.T) {
@@ -88,6 +115,64 @@ func TestDatagramsReachTheMemberNamed(t *testing.T) {
 	got, from, err = readWithin(h, 2*time.Second)
 	if err != nil || string(got) != "and back" || from.String() != h.AddrOf(member.PeerID).String() {
 		t.Fatalf("host read %q from %v (%v)", got, from, err)
+	}
+}
+
+// A receiver that stops registering expires after the TTL, even while others
+// keep sending to it, because only packets from that receiver refresh it.
+func TestIdleReceiverExpiresUnderInboundTraffic(t *testing.T) {
+	s := start(t)
+	host := mustHost(t, s)
+	member := mustJoin(t, s, host.Code)
+	sender := relayed(t, host)
+
+	receiverPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiverPC.Close()
+	registerDatagramReceiver(t, member, receiverPC)
+
+	if _, err := sender.WriteTo([]byte("before-expiry"), sender.AddrOf(member.PeerID)); err != nil {
+		t.Fatal(err)
+	}
+	var buf [2048]byte
+	_ = receiverPC.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := receiverPC.ReadFrom(buf[:])
+	if err != nil {
+		t.Fatalf("before expiry: %v", err)
+	}
+	_, payload, ok := parseRelayedDatagram(buf[:n])
+	if !ok || string(payload) != "before-expiry" {
+		t.Fatalf("before expiry got %q", payload)
+	}
+
+	keepSendingUntil := time.Now().Add(datagramRegistrationTTL + 2*datagramRegistrationSweepInterval)
+	for time.Now().Before(keepSendingUntil) {
+		if _, err := sender.WriteTo([]byte("keep-sending"), sender.AddrOf(member.PeerID)); err != nil {
+			t.Fatal(err)
+		}
+		_ = receiverPC.SetReadDeadline(time.Now().Add(120 * time.Millisecond))
+		if n, _, err := receiverPC.ReadFrom(buf[:]); err == nil {
+			_, _, _ = parseRelayedDatagram(buf[:n])
+		}
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := sender.WriteTo([]byte("after-expiry"), sender.AddrOf(member.PeerID)); err != nil {
+			t.Fatal(err)
+		}
+		_ = receiverPC.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+		n, _, err := receiverPC.ReadFrom(buf[:])
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			t.Fatalf("after expiry read: %v", err)
+		}
+		if _, payload, ok := parseRelayedDatagram(buf[:n]); ok {
+			t.Fatalf("received %q after expiry", payload)
+		}
 	}
 }
 
