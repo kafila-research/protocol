@@ -23,6 +23,10 @@ type Session struct {
 	Model   string
 	Members int
 
+	// RelayToken is this member's key to the rendezvous's datagram relay
+	// (Datagrams); empty from a rendezvous that relays no datagrams.
+	RelayToken string
+
 	control net.Conn
 }
 
@@ -126,7 +130,7 @@ func HostWith(addr, model string, members int, label string, capability []byte) 
 	}
 	return &Session{
 		Addr: addr, ID: w.Session, Code: w.Code, PeerID: w.PeerID,
-		Model: w.Model, Members: w.Members, control: keptAlive(conn),
+		Model: w.Model, Members: w.Members, RelayToken: w.RelayToken, control: keptAlive(conn),
 	}, nil
 }
 
@@ -146,7 +150,7 @@ func JoinWith(addr, code, label string, capability []byte) (*Session, error) {
 	}
 	return &Session{
 		Addr: addr, ID: w.Session, PeerID: w.PeerID,
-		Model: w.Model, Members: w.Members, control: keptAlive(conn),
+		Model: w.Model, Members: w.Members, RelayToken: w.RelayToken, control: keptAlive(conn),
 	}, nil
 }
 
