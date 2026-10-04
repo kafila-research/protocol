@@ -29,11 +29,16 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/kafila-research/protocol/rendezvous"
 )
 
-func main() {
+func main() { os.Exit(run()) }
+
+// run serves until a signal, returning the exit code, so that what was
+// deferred, the telemetry's last flush among it, happens before the exit.
+func run() int {
 	addr := flag.String("addr", ":443", "address to serve on; the UDP port above this one must also be open")
 	debug := flag.String("log", "info", "log level: debug, info, warn, error")
 	flag.Parse()
@@ -41,14 +46,23 @@ func main() {
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(*debug)); err != nil {
 		fmt.Fprintf(os.Stderr, "rendezvous: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	var handler slog.Handler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	// Records also go to an OpenTelemetry endpoint where one is configured
+	// (otlp.go), flushed before the process exits.
+	if cfg, ok := otlpFromEnv(); ok {
+		export := newOTLPExporter(cfg)
+		defer export.close(3 * time.Second)
+		handler = &otlpHandler{local: handler, export: export}
+		fmt.Fprintf(os.Stderr, "rendezvous: sending telemetry to %s\n", cfg.endpoint)
+	}
+	slog.SetDefault(slog.New(handler))
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "rendezvous: listen on %s: %v\n", *addr, err)
-		os.Exit(1)
+		return 1
 	}
 
 	fmt.Fprintf(os.Stderr,
@@ -68,6 +82,7 @@ func main() {
 	srv := rendezvous.NewServer()
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintf(os.Stderr, "rendezvous: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
