@@ -75,6 +75,9 @@ type datagramRelay struct {
 	byAddr    map[string]*relayRegistration
 	lastSweep time.Time
 	writes    chan relayWrite
+
+	// counts is the server's, or a set of its own for a relay made alone.
+	counts *relayCounts
 }
 
 // newDatagramRelay is a relay that checks registrations with token.
@@ -84,6 +87,7 @@ func newDatagramRelay(token func(session, peer string) (string, bool)) *datagram
 		byMember: map[string]*relayRegistration{},
 		byAddr:   map[string]*relayRegistration{},
 		writes:   make(chan relayWrite, 256),
+		counts:   &relayCounts{},
 	}
 	go r.writeLoop()
 	return r
@@ -92,6 +96,7 @@ func newDatagramRelay(token func(session, peer string) (string, bool)) *datagram
 func (r *datagramRelay) writeLoop() {
 	for w := range r.writes {
 		if _, err := w.pc.WriteTo(w.data, w.to); err != nil {
+			r.counts.writeFailed.Add(1)
 			slog.Debug("rendezvous datagram write failed", "to", w.to, "error", err)
 		}
 	}
@@ -101,6 +106,7 @@ func (r *datagramRelay) enqueueWrite(pc net.PacketConn, to net.Addr, data []byte
 	select {
 	case r.writes <- relayWrite{pc: pc, to: cloneAddr(to), data: data}:
 	default:
+		r.counts.queueFull.Add(1)
 		slog.Debug("rendezvous datagram write queue full", "to", to)
 	}
 }
@@ -222,14 +228,18 @@ func (r *datagramRelay) handle(pc net.PacketConn, b []byte, from net.Addr) {
 		sender := r.byAddr[from.String()]
 		if sender == nil {
 			r.mu.Unlock()
+			r.counts.unknownSender.Add(1)
 			return
 		}
 		sender.seen = now
 		receiver := r.byMember[relayMemberKey(sender.session, toPeer)]
 		r.mu.Unlock()
 		if receiver == nil {
+			r.counts.unknownReceiver.Add(1)
 			return
 		}
+		r.counts.datagrams.Add(1)
+		r.counts.datagramBytes.Add(int64(len(payload)))
 
 		frame := []byte{datagramFrameFromPeer}
 		frame = appendDatagramField(frame, sender.peer)
