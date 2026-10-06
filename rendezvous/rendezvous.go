@@ -44,6 +44,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kafila-research/protocol/reach"
@@ -167,10 +168,16 @@ type Server struct {
 	reach *reach.Server
 
 	datagrams *datagramRelay
+
+	// counts is what has been relayed, reported a minute at a time until
+	// done is closed, once, by Close.
+	counts   relayCounts
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 func NewServer() *Server {
-	return &Server{sessions: map[string]*session{}, byCode: map[string]*session{}}
+	return &Server{sessions: map[string]*session{}, byCode: map[string]*session{}, done: make(chan struct{})}
 }
 
 func newID(n int) string {
@@ -234,6 +241,8 @@ func (s *Server) Serve(ln net.Listener) error {
 	s.mu.Lock()
 	if s.datagrams == nil {
 		s.datagrams = newDatagramRelay(s.memberToken)
+		s.datagrams.counts = &s.counts
+		go s.counts.reportCounts(s.done)
 	}
 	relay := s.datagrams
 	s.mu.Unlock()
@@ -263,6 +272,11 @@ func (s *Server) Addr() string {
 }
 
 func (s *Server) Close() error {
+	s.doneOnce.Do(func() {
+		if s.done != nil {
+			close(s.done)
+		}
+	})
 	s.mu.Lock()
 	ln, rs := s.ln, s.reach
 	s.mu.Unlock()
@@ -543,8 +557,12 @@ func (s *Server) doDial(conn net.Conn, h Hello) {
 	writeJSON(conn, Welcome{OK: true})
 	slog.Debug("rendezvous: relaying",
 		"session", h.Session, "from", h.From, "to", h.To, "stream", h.Stream)
-	splice(conn, peer, h.From, h.To)
+	splice(conn, peer, h.From, h.To, &s.counts)
 }
+
+// acceptProbe is how long a parked accept is read for before it is taken as
+// alive (parkedAcceptIsAlive).
+const acceptProbe = 5 * time.Millisecond
 
 // waitKey is what a dial and an accept must agree on to be paired: which peer,
 // and which of that peer's listeners.
@@ -562,9 +580,14 @@ type waitKey struct {
 // in the send buffer while the reset is still in flight, so the dead connection
 // passes the test and gets spliced to a ring that then hangs on its first frame.
 //
-// The wait is short and is paid once per edge, when it is set up.
+// The wait is paid on every dial, which for a ring is once per edge but for a
+// member's chat is once per request. A gone acceptor's end-of-file or reset is
+// already waiting when the read starts, so it needs no time to show; the wait
+// only delays the live case, and a peer that vanished without closing passes
+// at any length. So it is a few milliseconds, not the 150 a member's every
+// chat used to pay.
 func parkedAcceptIsAlive(c net.Conn) bool {
-	if err := c.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+	if err := c.SetReadDeadline(time.Now().Add(acceptProbe)); err != nil {
 		return false
 	}
 	defer c.SetReadDeadline(time.Time{}) //nolint:errcheck // best effort; the splice sets its own
@@ -629,7 +652,10 @@ func tcpOf(c net.Conn) *net.TCPConn {
 // splice joins a dialer to the accept that was parked for it and copies until
 // both directions are done. The two peer ids name the directions, so a log line
 // says which way bytes stopped moving.
-func splice(dialer, acceptor net.Conn, from, to string) {
+func splice(dialer, acceptor net.Conn, from, to string, counts *relayCounts) {
+	counts.streams.Add(1)
+	counts.streamsOpen.Add(1)
+	defer counts.streamsOpen.Add(-1)
 	// A ring link is one-way: the head writes to the tail and never reads from
 	// that connection. The unused direction therefore sits idle for as long as
 	// the session is idle, and a relayed hop can sit behind a VPN or a NAT that
@@ -645,7 +671,7 @@ func splice(dialer, acceptor net.Conn, from, to string) {
 	}
 	done := make(chan ended, 2)
 	cp := func(from, to string, dst, src net.Conn) {
-		n, err := relay(dst, src)
+		n, err := relay(dst, src, &counts.streamBytes)
 		// Propagate the half-close rather than tearing the pair down: the peer
 		// that stopped writing has said so, and the other direction may still
 		// have a whole response to carry.
@@ -676,7 +702,7 @@ func splice(dialer, acceptor net.Conn, from, to string) {
 // step straight past the bytes the greeting's decoder had already taken out of
 // it. Doing the loop here means the reads go through whatever Read the caller
 // gave us, and it makes each chunk visible.
-func relay(dst, src net.Conn) (int64, error) {
+func relay(dst, src net.Conn, counted *atomic.Int64) (int64, error) {
 	buf := make([]byte, 64*1024)
 	var total int64
 	for {
@@ -684,6 +710,7 @@ func relay(dst, src net.Conn) (int64, error) {
 		if n > 0 {
 			w, werr := dst.Write(buf[:n])
 			total += int64(w)
+			counted.Add(int64(w))
 			if werr != nil {
 				return total, werr
 			}
